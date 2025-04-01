@@ -1,69 +1,93 @@
 package adapters
 
 import (
+	"bufio"
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/aiven/aiven-go-client/v2"
 	"github.com/dbtuneai/agent/pkg/adeptersinterfaces"
 	"github.com/dbtuneai/agent/pkg/agent"
 	"github.com/dbtuneai/agent/pkg/collectors"
 	"github.com/dbtuneai/agent/pkg/internal/parameters"
 	"github.com/dbtuneai/agent/pkg/internal/utils"
-	"github.com/aiven/go-client-codegen"
-        "github.com/aiven/go-client-codegen/handler/service"
+	"github.com/spf13/viper"
+
 	"github.com/hashicorp/go-retryablehttp"
 	pgPool "github.com/jackc/pgx/v5/pgxpool"
-	"github.com/spf13/viper"
 )
 
 // AivenPostgreSQLAdapter represents an adapter for connecting to Aiven PostgreSQL services
 type AivenPostgreSQLAdapter struct {
 	DefaultPostgreSQLAdapter
-	aivenConfig    adeptersinterfaces.AivenConfig
-	serviceHandler service.Handler
-	state          *adeptersinterfaces.AivenState
+	aivenConfig     adeptersinterfaces.AivenConfig
+	aivenClient     *aiven.Client
+	state           *adeptersinterfaces.AivenState
+}
+
+// planMemoryMapping maps Aiven plan types to memory in bytes
+var planMemoryMapping = map[string]int64{
+	"hobbyist":  int64(1 * 1024 * 1024 * 1024),   // 1GB
+	"startup-4": int64(4 * 1024 * 1024 * 1024),   // 4GB
+	"startup-8": int64(8 * 1024 * 1024 * 1024),   // 8GB
+	"business-4": int64(4 * 1024 * 1024 * 1024),  // 4GB
+	"business-8": int64(8 * 1024 * 1024 * 1024),  // 8GB
+	"business-16": int64(16 * 1024 * 1024 * 1024), // 16GB
+	"premium-8": int64(8 * 1024 * 1024 * 1024),   // 8GB
+	"premium-16": int64(16 * 1024 * 1024 * 1024), // 16GB
+	"premium-32": int64(32 * 1024 * 1024 * 1024), // 32GB
+}
+
+// planCPUMapping maps Aiven plan types to CPU count
+var planCPUMapping = map[string]int{
+	"hobbyist":  1,
+	"startup-4": 2,
+	"startup-8": 2,
+	"business-4": 2,
+	"business-8": 4,
+	"business-16": 4,
+	"premium-8": 4,
+	"premium-16": 8,
+	"premium-32": 12,
 }
 
 // aivenModifiableParams defines which PostgreSQL parameters can be modified on Aiven
 // and how they should be applied (pg config or service-level config)
 var aivenModifiableParams = map[string]struct {
-	Modifiable  bool
-	ServiceLevel bool // If true, apply at service level instead of under pg config
+    Modifiable  bool
+    ServiceLevel bool // If true, apply at service level instead of under pg config
 }{
-	// Parameters confirmed modifiable through pg config
-	"bgwriter_lru_maxpages":            {true, false},
-	"bgwriter_delay":                   {true, false},
-	"max_parallel_workers_per_gather":  {true, false},
-	"max_parallel_workers":             {true, false},
-	"work_mem":                         {true, true},
-	"shared_buffers_percentage":        {true, true}, // Instead of shared_buffers
-	"max_worker_processes":             {true, true}, // Only can be increased
-	
-	// Known to be restricted (for documentation)
-	"max_wal_size":                    {false, false},
-	"min_wal_size":                    {false, false},
-	"random_page_cost":                {false, false},
-	"seq_page_cost":                   {false, false},
-	"checkpoint_completion_target":    {false, false},
-	"effective_io_concurrency":        {false, false},
-	"shared_buffers":                  {false, false}, // Use shared_buffers_percentage instead
-}
-
-// Helper function to create bool pointers for API requests
-func boolPtr(b bool) *bool {
-	return &b
+    // Parameters confirmed modifiable through pg config
+    "bgwriter_lru_maxpages":         {true, false},
+    "bgwriter_delay":                {true, false},
+    "max_parallel_workers_per_gather": {true, false},
+    "max_parallel_workers":          {true, false},
+    
+    // Parameters that must be applied at service level
+    "work_mem":                      {true, true},
+    "shared_buffers_percentage":     {true, true}, // Instead of shared_buffers
+    
+    // max_worker_processes can only be increased, not decreased
+    "max_worker_processes":          {true, true},
+    
+    // Known to be restricted (for documentation)
+    "max_wal_size":                  {false, false},
+    "min_wal_size":                  {false, false},
+    "random_page_cost":              {false, false},
+    "seq_page_cost":                 {false, false},
+    "checkpoint_completion_target":  {false, false},
+    "effective_io_concurrency":      {false, false},
+    "shared_buffers":                {false, false}, // Use shared_buffers_percentage instead
 }
 
 // CreateAivenPostgreSQLAdapter creates a new Aiven PostgreSQL adapter
 func CreateAivenPostgreSQLAdapter() (*AivenPostgreSQLAdapter, error) {
-	// Create a new Viper instance for Aiven configuration if the sub-config doesn't exist
+	// Load configuration from viper
 	dbtuneConfig := viper.Sub("aiven")
 	if dbtuneConfig == nil {
-		// If the section doesn't exist in the config file, create a new Viper instance
 		dbtuneConfig = viper.New()
 	}
 
@@ -85,24 +109,9 @@ func CreateAivenPostgreSQLAdapter() (*AivenPostgreSQLAdapter, error) {
 	}
 
 	// Create Aiven client
-	client, err := aiven.NewClient([]aiven.Option{
-		aiven.TokenOpt(aivenConfig.APIToken),
-	}...)
+	aivenClient, err := aiven.NewTokenClient(aivenConfig.APIToken, "dbtune-agent")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Aiven client: %v", err)
-	}
-	
-	// Create service handler
-	serviceHandler := service.NewHandler(client)
-	
-	// Verify connectivity by trying to get the service
-	_, err = serviceHandler.ServiceGet(
-		context.Background(),
-		aivenConfig.ProjectName,
-		aivenConfig.ServiceName,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Aiven API: %v", err)
 	}
 
 	// Create default PostgreSQL adapter as base
@@ -114,8 +123,8 @@ func CreateAivenPostgreSQLAdapter() (*AivenPostgreSQLAdapter, error) {
 	// Create adapter
 	adapter := &AivenPostgreSQLAdapter{
 		DefaultPostgreSQLAdapter: *defaultAdapter,
-		aivenConfig:              aivenConfig,
-		serviceHandler:           serviceHandler,
+		aivenConfig:             aivenConfig,
+		aivenClient:             aivenClient,
 		state: &adeptersinterfaces.AivenState{
 			LastAppliedConfig: time.Time{},
 		},
@@ -145,70 +154,18 @@ func (adapter *AivenPostgreSQLAdapter) PGDriver() *pgPool.Pool {
 }
 
 func (adapter *AivenPostgreSQLAdapter) APIClient() *retryablehttp.Client {
-	return adapter.ApiClient
-}
-
-// getServicePlanResourceInfo retrieves the CPU and memory information for a service plan
-// directly from the Aiven API and database by querying runtime information
-func getServicePlanResourceInfo(ctx context.Context, adapter *AivenPostgreSQLAdapter) (int, int64, error) {
-	// Get service information from Aiven API
-	service, err := adapter.serviceHandler.ServiceGet(
-		ctx,
-		adapter.aivenConfig.ProjectName,
-		adapter.aivenConfig.ServiceName,
-	)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get service info from API: %v", err)
-	}
-	
-	// Try to get CPU count from PostgreSQL
-	var cpuCount int
-	err = adapter.pgDriver.QueryRow(ctx, "SELECT current_setting('max_worker_processes')::int").Scan(&cpuCount)
-	if err != nil {
-		adapter.Logger().Warnf("Failed to get CPU count from PostgreSQL: %v", err)
-		
-		// Use node_count from service if available
-		if service.NodeCount != nil && *service.NodeCount > 0 {
-			cpuCount = *service.NodeCount * 2 // Estimate: typically each node has 2 CPUs
-		} else {
-			// Use a safe default
-			cpuCount = 2
-			adapter.Logger().Warnf("Could not determine CPU count, using default: %d", cpuCount)
-		}
-	}
-	
-	// Try to get memory information from PostgreSQL
-	var totalMemoryMB int64
-	err = adapter.pgDriver.QueryRow(ctx, "SELECT ROUND(current_setting('shared_buffers')::bigint*8/1024/0.25)").Scan(&totalMemoryMB)
-	if err != nil {
-		adapter.Logger().Warnf("Failed to get memory from PostgreSQL: %v", err)
-		
-		// Fallback to node_memory_mb if available
-		if service.NodeMemoryMb != nil && *service.NodeMemoryMb > 0 {
-			totalMemoryMB = int64(*service.NodeMemoryMb)
-		} else {
-			// Use a safe default
-			totalMemoryMB = 4096 // 4 GB in MB
-			adapter.Logger().Warnf("Could not determine memory size, using default: %d MB", totalMemoryMB)
-		}
-	}
-	
-	// Convert MB to bytes
-	totalMemoryBytes := totalMemoryMB * 1024 * 1024
-	
-	return cpuCount, totalMemoryBytes, nil
+	return adapter.APIClient()
 }
 
 // GetSystemInfo returns system information for the Aiven PostgreSQL service
 func (adapter *AivenPostgreSQLAdapter) GetSystemInfo() ([]utils.FlatValue, error) {
-	adapter.Logger().Info("Collecting Aiven system info")
+	adapter.Logger().Println("Collecting Aiven system info")
 
 	var systemInfo []utils.FlatValue
-	ctx := context.Background()
 
 	// Get service information from Aiven API
-	service, err := adapter.serviceHandler.ServiceGet(
-		ctx,
+	service, err := adapter.aivenClient.Services.Get(
+		context.Background(),
 		adapter.aivenConfig.ProjectName,
 		adapter.aivenConfig.ServiceName,
 	)
@@ -216,11 +173,27 @@ func (adapter *AivenPostgreSQLAdapter) GetSystemInfo() ([]utils.FlatValue, error
 		return nil, fmt.Errorf("failed to get service info: %v", err)
 	}
 
-	// Get accurate CPU and memory information
-	numCPUs, totalMemoryBytes, err := getServicePlanResourceInfo(ctx, adapter)
-	if err != nil {
-		adapter.Logger().Warnf("Error getting resource info: %v", err)
-		// Continue with collection, we'll try to get other metrics
+	// Extract CPU and memory information based on service plan
+	plan := service.Plan
+	var numCPUs int
+	var totalMemoryBytes int64
+
+	// Get CPU count from plan mapping
+	if cpuCount, ok := planCPUMapping[plan]; ok {
+		numCPUs = cpuCount
+	} else {
+		// Default to 2 CPUs if plan is not recognized
+		numCPUs = 2
+		adapter.Logger().Warnf("Unknown Aiven plan %s, using default CPU count: %d", plan, numCPUs)
+	}
+
+	// Get memory from plan mapping
+	if memory, ok := planMemoryMapping[plan]; ok {
+		totalMemoryBytes = memory
+	} else {
+		// Default to 4GB if plan is not recognized
+		totalMemoryBytes = 4 * 1024 * 1024 * 1024
+		adapter.Logger().Warnf("Unknown Aiven plan %s, using default memory: %d bytes", plan, totalMemoryBytes)
 	}
 
 	// Store hardware information in state
@@ -244,42 +217,13 @@ func (adapter *AivenPostgreSQLAdapter) GetSystemInfo() ([]utils.FlatValue, error
 	// Create metrics
 	totalMemory, _ := utils.NewMetric("node_memory_total", totalMemoryBytes, utils.Int)
 	noCPUsMetric, _ := utils.NewMetric("node_cpu_count", numCPUs, utils.Int)
-	version, _ := utils.NewMetric("system_info_pg_version", pgVersion, utils.String)
+	version, _ := utils.NewMetric("pg_version", pgVersion, utils.String)
 	maxConnectionsMetric, _ := utils.NewMetric("pg_max_connections", maxConnections, utils.Int)
-	planMetric, _ := utils.NewMetric("aiven_service_plan", service.Plan, utils.String)
-	
-	// Get service state
-	stateMetric, _ := utils.NewMetric("aiven_service_state", service.State, utils.String)
 	
 	// Aiven uses SSD storage
 	diskTypeMetric, _ := utils.NewMetric("node_disk_device_type", "SSD", utils.String)
-	
-	// Get disk information if available from service info
-	if service.DiskSpaceMb != nil && *service.DiskSpaceMb > 0 {
-		diskSizeMB := *service.DiskSpaceMb
-		diskSizeBytes := diskSizeMB * 1024 * 1024
-		diskSizeMetric, _ := utils.NewMetric("node_disk_size", diskSizeBytes, utils.Int)
-		systemInfo = append(systemInfo, diskSizeMetric)
-	}
-	
-	// Try to get used disk space from PostgreSQL
-	var usedDiskBytes int64
-	err = adapter.pgDriver.QueryRow(ctx, "SELECT COALESCE(SUM(pg_database_size(datname)), 0) FROM pg_database").Scan(&usedDiskBytes)
-	if err == nil {
-		diskUsedMetric, _ := utils.NewMetric("node_disk_used", usedDiskBytes, utils.Int)
-		systemInfo = append(systemInfo, diskUsedMetric)
-		
-		// Calculate disk usage percentage if we have total disk space
-		if service.DiskSpaceMb != nil && *service.DiskSpaceMb > 0 {
-			diskTotalBytes := int64(*service.DiskSpaceMb) * 1024 * 1024
-			diskPercentage := float64(usedDiskBytes) * 100.0 / float64(diskTotalBytes)
-			diskPercentMetric, _ := utils.NewMetric("node_disk_usage_percent", diskPercentage, utils.Float)
-			systemInfo = append(systemInfo, diskPercentMetric)
-		}
-	}
 
-	systemInfo = append(systemInfo, version, totalMemory, maxConnectionsMetric, noCPUsMetric, 
-		diskTypeMetric, planMetric, stateMetric)
+	systemInfo = append(systemInfo, version, totalMemory, maxConnectionsMetric, noCPUsMetric, diskTypeMetric)
 
 	return systemInfo, nil
 }
@@ -295,11 +239,10 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 	}
 
 	// Get the current service configuration
-	service, err := adapter.serviceHandler.ServiceGet(
+	service, err := adapter.aivenClient.Services.Get(
 		context.Background(),
 		adapter.aivenConfig.ProjectName, 
 		adapter.aivenConfig.ServiceName,
-		service.ServiceGetIncludeSecrets(true), // Include secrets to get current user_config
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get service configuration: %v", err)
@@ -308,18 +251,28 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 	// Start with current user_config or create a new one
 	userConfig := service.UserConfig
 	if userConfig == nil {
-		userConfig = make(map[string]any)
+		userConfig = make(map[string]interface{})
 	}
 
 	// Ensure pg configuration section exists
 	pgParams, ok := userConfig["pg"]
 	if !ok || pgParams == nil {
-		pgParams = make(map[string]any)
+		pgParams = make(map[string]interface{})
 	}
 
-	pgParamsMap, ok := pgParams.(map[string]any)
+	pgParamsMap, ok := pgParams.(map[string]interface{})
 	if !ok {
-		pgParamsMap = make(map[string]any)
+		pgParamsMap = make(map[string]interface{})
+	}
+
+	// Log file for debugging parameter changes
+	var logWriter *bufio.Writer
+	logFile, err := os.OpenFile("/tmp/aiven_param_changes.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer logFile.Close()
+		logWriter = bufio.NewWriter(logFile)
+		defer logWriter.Flush()
+		fmt.Fprintf(logWriter, "[%s] Applying config changes to Aiven PostgreSQL\n", time.Now().Format(time.RFC3339))
 	}
 
 	// Track if any changes were made
@@ -333,9 +286,11 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 		}
 		
 		// Handle shared_buffers specially - convert to shared_buffers_percentage if needed
+		// This is a special case for Aiven
 		paramName := knobConfig.Name
 		if paramName == "shared_buffers" {
 			// Convert shared_buffers to shared_buffers_percentage
+			// Get total memory in bytes
 			if adapter.state.Hardware != nil && adapter.state.Hardware.TotalMemoryBytes > 0 {
 				// Shared buffers in pg is in 8KB blocks, convert to bytes
 				sharedBuffersBytes := float64(knobConfig.Setting.(float64)) * 8 * 1024
@@ -350,6 +305,9 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 				paramName = "shared_buffers_percentage"
 				knobConfig.Setting = percentage
 				adapter.Logger().Infof("Converting shared_buffers to shared_buffers_percentage: %.2f%%", percentage)
+				if logFile != nil {
+					fmt.Fprintf(logWriter, "Converting shared_buffers to shared_buffers_percentage: %.2f%%\n", percentage)
+				}
 			} else {
 				adapter.Logger().Warn("Cannot convert shared_buffers to percentage - hardware info not available")
 				continue
@@ -360,6 +318,9 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 		paramInfo, exists := aivenModifiableParams[paramName]
 		if !exists {
 			adapter.Logger().Warnf("Parameter %s has unknown modifiability status on Aiven, attempting anyway", paramName)
+			if logFile != nil {
+				fmt.Fprintf(logWriter, "Parameter %s has unknown status, attempting anyway\n", paramName)
+			}
 			// Default to applying under pg config
 			paramInfo = struct {
 				Modifiable  bool
@@ -367,6 +328,9 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 			}{true, false}
 		} else if !paramInfo.Modifiable {
 			adapter.Logger().Warnf("Parameter %s is known to be restricted by Aiven, skipping", paramName)
+			if logFile != nil {
+				fmt.Fprintf(logWriter, "Parameter %s is restricted, skipping\n", paramName)
+			}
 			continue
 		}
 		
@@ -387,15 +351,19 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 			newValue := int(knobConfig.Setting.(float64))
 			if newValue < currentValue {
 				adapter.Logger().Warnf("Cannot decrease max_worker_processes from %d to %d on Aiven", currentValue, newValue)
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "Cannot decrease max_worker_processes from %d to %d\n", currentValue, newValue)
+				}
 				continue
 			}
 		}
 		
 		// Convert setting to appropriate type
-		var settingValue any
+		var settingValue interface{}
 		switch v := knobConfig.Setting.(type) {
 		case float64:
 			// For numeric parameters that should be integer, convert to integer format
+			// Try to determine if this is an integer parameter based on the value
 			if v == float64(int64(v)) {
 				settingValue = int64(v)
 			} else {
@@ -408,6 +376,10 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 		default:
 			// For other types, convert to string
 			settingValue = fmt.Sprintf("%v", v)
+		}
+		
+		if logWriter != nil {
+			fmt.Fprintf(logWriter, "Setting %s = %v (service level: %v)\n", paramName, settingValue, paramInfo.ServiceLevel)
 		}
 		
 		// Apply the parameter at the correct level (service level or pg config)
@@ -430,19 +402,19 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 	userConfig["pg"] = pgParamsMap
 	
 	// Create the update request
-	serviceUpdateIn := &service.ServiceUpdateIn{
-		UserConfig: &userConfig,
+	updateReq := aiven.UpdateServiceRequest{
+		UserConfig: userConfig,
 	}
 
 	// For parameters that require restart, we need to power cycle the service
 	needsRestart := proposedConfig.KnobApplication == "restart"
 	
 	// Apply the configuration update
-	_, err = adapter.serviceHandler.ServiceUpdate(
+	_, err = adapter.aivenClient.Services.Update(
 		context.Background(),
 		adapter.aivenConfig.ProjectName,
 		adapter.aivenConfig.ServiceName,
-		serviceUpdateIn,
+		updateReq,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update PostgreSQL parameters: %v", err)
@@ -452,16 +424,14 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 	if needsRestart {
 		adapter.Logger().Info("Restarting Aiven PostgreSQL service")
         
-		// First, power down the service by setting powered: false
-		powerDownUpdate := &service.ServiceUpdateIn{
-			Powered: boolPtr(false),
-		}
-		
-		_, err = adapter.serviceHandler.ServiceUpdate(
+		// First, power down the service
+		_, err = adapter.aivenClient.Services.Update(
 			context.Background(),
 			adapter.aivenConfig.ProjectName,
 			adapter.aivenConfig.ServiceName,
-			powerDownUpdate,
+			aiven.UpdateServiceRequest{
+				Powered: false,
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("failed to power down service: %v", err)
@@ -474,15 +444,13 @@ func (adapter *AivenPostgreSQLAdapter) ApplyConfig(proposedConfig *agent.Propose
 		}
 
 		// Power the service back up
-		powerUpUpdate := &service.ServiceUpdateIn{
-			Powered: boolPtr(true),
-		}
-		
-		_, err = adapter.serviceHandler.ServiceUpdate(
+		_, err = adapter.aivenClient.Services.Update(
 			context.Background(),
 			adapter.aivenConfig.ProjectName,
 			adapter.aivenConfig.ServiceName,
-			powerUpUpdate,
+			aiven.UpdateServiceRequest{
+				Powered: true,
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("failed to power up service: %v", err)
@@ -525,7 +493,7 @@ func (adapter *AivenPostgreSQLAdapter) waitForServiceState(targetState string) e
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for service to reach state %s", targetState)
 		case <-time.After(10 * time.Second):
-			service, err := adapter.serviceHandler.ServiceGet(
+			service, err := adapter.aivenClient.Services.Get(
 				context.Background(),
 				adapter.aivenConfig.ProjectName,
 				adapter.aivenConfig.ServiceName,
@@ -607,39 +575,8 @@ func (adapter *AivenPostgreSQLAdapter) Guardrails() *agent.GuardrailType {
 		critical := agent.Critical
 		return &critical
 	}
-	
-	// Check for service health issues from the API
-	serviceHealth, err := adapter.checkServiceHealth()
-	if err != nil {
-		adapter.Logger().Warnf("Failed to check service health from API: %v", err)
-	} else if !serviceHealth {
-		// If we detected a service issue from the API, trigger critical guardrail
-		adapter.Logger().Warn("Service health check failed from API")
-		critical := agent.Critical
-		return &critical
-	}
 
 	return nil
-}
-
-// checkServiceHealth checks if the service is healthy using the Aiven API
-func (adapter *AivenPostgreSQLAdapter) checkServiceHealth() (bool, error) {
-	service, err := adapter.serviceHandler.ServiceGet(
-		context.Background(),
-		adapter.aivenConfig.ProjectName,
-		adapter.aivenConfig.ServiceName,
-	)
-	if err != nil {
-		return false, fmt.Errorf("failed to get service: %v", err)
-	}
-	
-	// Check if service is in a healthy state
-	// RUNNING is the normal state for an Aiven service
-	if service.State != "RUNNING" {
-		return false, nil
-	}
-	
-	return true, nil
 }
 
 // AivenCollectors returns the metrics collectors for Aiven PostgreSQL
@@ -663,7 +600,7 @@ func AivenCollectors(adapter *AivenPostgreSQLAdapter) []agent.MetricCollector {
 		{
 			Key:        "system_db_size",
 			MetricType: "int",
-			Collector:  collectors.DatabaseSize(adapter),
+			Collector:  collectors.DatabaseSize(adapter), // Use standard collector for consistency
 		},
 		{
 			Key:        "database_autovacuum_count",
@@ -688,17 +625,17 @@ func AivenCollectors(adapter *AivenPostgreSQLAdapter) []agent.MetricCollector {
 		{
 			Key:        "hardware",
 			MetricType: "int",
-			Collector:  collectors.AivenHardwareInfo(adapter),
+			Collector:  AivenHardwareInfo(adapter),
 		},
 	}
 }
 
 // AivenHardwareInfo collects hardware metrics for Aiven PostgreSQL
-func AivenHardwareInfo(adapter adeptersinterfaces.AivenPostgreSQLAdapter) func(ctx context.Context, state *agent.MetricsState) error {
+func AivenHardwareInfo(adapter *AivenPostgreSQLAdapter) func(ctx context.Context, state *agent.MetricsState) error {
 	return func(ctx context.Context, state *agent.MetricsState) error {
 		// For connection count as CPU usage indicator
 		var connectionCount int
-		err := adapter.PGDriver().QueryRow(ctx, 
+		err := adapter.pgDriver.QueryRow(ctx, 
 			`SELECT count(*) FROM pg_stat_activity WHERE state <> 'idle'`).Scan(&connectionCount)
 		
 		if err != nil {
@@ -708,7 +645,7 @@ func AivenHardwareInfo(adapter adeptersinterfaces.AivenPostgreSQLAdapter) func(c
 
 		// Get max connections
 		var maxConnections int
-		err = adapter.PGDriver().QueryRow(ctx, 
+		err = adapter.pgDriver.QueryRow(ctx, 
 			`SELECT current_setting('max_connections')::int`).Scan(&maxConnections)
 		
 		if err != nil {
@@ -723,13 +660,13 @@ func AivenHardwareInfo(adapter adeptersinterfaces.AivenPostgreSQLAdapter) func(c
 
 		// For memory used, check database size
 		var memoryUsed int64
-		err = adapter.PGDriver().QueryRow(ctx, 
+		err = adapter.pgDriver.QueryRow(ctx, 
 			`SELECT COALESCE(sum(pg_database_size(datname)), 0) FROM pg_database`).Scan(&memoryUsed)
 		
 		if err != nil {
 			// On error, try just the current database
 			adapter.Logger().Warnf("Failed to get full memory usage, falling back to current database: %v", err)
-			err = adapter.PGDriver().QueryRow(ctx, 
+			err = adapter.pgDriver.QueryRow(ctx, 
 				`SELECT pg_database_size(current_database())`).Scan(&memoryUsed)
 			
 			if err != nil {
@@ -742,47 +679,14 @@ func AivenHardwareInfo(adapter adeptersinterfaces.AivenPostgreSQLAdapter) func(c
 		state.AddMetric(memoryUsedMetric)
 
 		// For memory available, calculate from total minus used
-		if adapter.GetAivenState().Hardware != nil {
-			memoryAvailable := adapter.GetAivenState().Hardware.TotalMemoryBytes - memoryUsed
+		if adapter.state.Hardware != nil {
+			memoryAvailable := adapter.state.Hardware.TotalMemoryBytes - memoryUsed
 			if memoryAvailable < 0 {
 				memoryAvailable = 0
 			}
 			
 			memoryAvailableMetric, _ := utils.NewMetric("node_memory_available", memoryAvailable, utils.Int)
 			state.AddMetric(memoryAvailableMetric)
-		}
-
-		// Add connection usage percentage
-		connectionUsageMetric, _ := utils.NewMetric("node_connection_usage_percent", cpuUsage, utils.Float)
-		state.AddMetric(connectionUsageMetric)
-		
-		// Get service information via API if possible
-		if aivenAdapter, ok := adapter.(adeptersinterfaces.AivenPostgreSQLAdapter); ok {
-			service, err := adapter.GetAivenConfig().GetService(ctx)
-			if err == nil && service != nil {
-				// Add service state as metric
-				stateMetric, _ := utils.NewMetric("aiven_service_state", service.State, utils.String)
-				state.AddMetric(stateMetric)
-				
-				// Add plan as metric
-				planMetric, _ := utils.NewMetric("aiven_service_plan", service.Plan, utils.String)
-				state.AddMetric(planMetric)
-				
-				// Add disk space metrics if available
-				if service.DiskSpaceMb != nil && *service.DiskSpaceMb > 0 {
-					diskSizeMB := int64(*service.DiskSpaceMb)
-					diskSizeBytes := diskSizeMB * 1024 * 1024
-					diskTotalMetric, _ := utils.NewMetric("node_disk_total", diskSizeBytes, utils.Int)
-					state.AddMetric(diskTotalMetric)
-					
-					// Calculate disk usage percentage if we have both total and used
-					if memoryUsed > 0 {
-						diskPercentage := (float64(memoryUsed) / float64(diskSizeBytes)) * 100
-						diskUsageMetric, _ := utils.NewMetric("node_disk_usage_percent", diskPercentage, utils.Float)
-						state.AddMetric(diskUsageMetric)
-					}
-				}
-			}
 		}
 
 		return nil
